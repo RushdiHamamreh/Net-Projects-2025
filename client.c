@@ -116,7 +116,14 @@ int main() {
         server.sin_port = htons(PORT);
         server.sin_addr.s_addr = inet_addr(ip);
 
-        connect(sock, (struct sockaddr *)&server, sizeof(server));
+        if (connect(sock, (struct sockaddr *)&server, sizeof(server)) == SOCKET_ERROR) {
+    printf("\nERROR: Could not connect to server at IP %s\n", ip);
+    fclose(f);
+    closesocket(sock);
+    WSACleanup();
+    continue;
+}
+
 
         snprintf(header16, HEADER_SIZE, "%-16d", fileSize);
         send(sock, header16, HEADER_SIZE, 0);
