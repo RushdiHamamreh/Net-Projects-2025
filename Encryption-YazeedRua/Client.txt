@@ -1,0 +1,247 @@
+// client.c
+#define _WIN32_WINNT 0x0600
+#include <winsock2.h>
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <openssl/evp.h>
+
+#pragma comment(lib, "ws2_32.lib")
+
+#define PORT 12345
+#define BUFFER_SIZE 4096
+
+// MUST match server key
+unsigned char KEY[] = "ThisIsA32ByteLongSecretKey123456";
+
+// Helper: send all data
+int send_all(SOCKET sock, const unsigned char* data, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int n = send(sock, (const char*)(data + sent), len - sent, 0);
+        if (n <= 0) return -1;
+        sent += n;
+    }
+    return 0;
+}
+
+// Helper: receive exactly n bytes
+int recv_all(SOCKET sock, unsigned char* buf, int n) {
+    int received = 0;
+    while (received < n) {
+        int r = recv(sock, (char*)(buf + received), n - received, 0);
+        if (r <= 0) return -1;
+        received += r;
+    }
+    return 0;
+}
+
+// Decrypt using AES-256-GCM
+int decrypt_aes_gcm(const unsigned char* ciphertext, int ciphertext_len,
+                    const unsigned char* tag, const unsigned char* nonce,
+                    unsigned char* plaintext) {
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+
+    if (!EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) goto fail;
+    if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL)) goto fail;
+    if (!EVP_DecryptInit_ex(ctx, NULL, NULL, KEY, nonce)) goto fail;
+
+    int len;
+    if (!EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, ciphertext_len)) goto fail;
+    int plaintext_len = len;
+
+    if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, (void*)tag)) goto fail;
+
+    if (!EVP_DecryptFinal_ex(ctx, plaintext + len, &len)) {
+        // Authentication failed
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    plaintext_len += len;
+
+    EVP_CIPHER_CTX_free(ctx);
+    return plaintext_len;
+
+fail:
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc != 2) {
+        printf("Usage: client.exe <filename>\n");
+        return 1;
+    }
+
+    char* filename = argv[1];
+
+    // Read file
+    FILE* fp = fopen(filename, "rb");
+    if (!fp) {
+        printf("[-] Could not open file: %s\n", filename);
+        return 1;
+    }
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    unsigned char* file_data = malloc(file_size);
+    if (!file_data) {
+        fclose(fp);
+        printf("[-] Memory allocation failed\n");
+        return 1;
+    }
+    if (fread(file_data, 1, file_size, fp) != (size_t)file_size) {
+        fclose(fp);
+        free(file_data);
+        printf("[-] Failed to read file\n");
+        return 1;
+    }
+    fclose(fp);
+
+    // Initialize Winsock
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        free(file_data);
+        printf("[-] WSAStartup failed\n");
+        return 1;
+    }
+
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET) {
+        free(file_data);
+        WSACleanup();
+        printf("[-] Socket creation failed\n");
+        return 1;
+    }
+
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
+    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
+        free(file_data);
+        closesocket(sock);
+        WSACleanup();
+        printf("[-] Connection failed. Is server running?\n");
+        return 1;
+    }
+
+    printf("[+] Connected to server\n");
+
+    // === Send filename ===
+    int fname_len = strlen(filename);
+    unsigned char fname_len_bytes[4] = {
+        (fname_len >> 24) & 0xFF,
+        (fname_len >> 16) & 0xFF,
+        (fname_len >> 8) & 0xFF,
+        fname_len & 0xFF
+    };
+    if (send_all(sock, fname_len_bytes, 4) < 0 ||
+        send_all(sock, (unsigned char*)filename, fname_len) < 0) {
+        printf("[-] Failed to send filename\n");
+        goto cleanup;
+    }
+
+    // === Send file size (8 bytes) ===
+    unsigned char file_size_bytes[8] = {
+        (file_size >> 56) & 0xFF,
+        (file_size >> 48) & 0xFF,
+        (file_size >> 40) & 0xFF,
+        (file_size >> 32) & 0xFF,
+        (file_size >> 24) & 0xFF,
+        (file_size >> 16) & 0xFF,
+        (file_size >> 8) & 0xFF,
+        file_size & 0xFF
+    };
+    if (send_all(sock, file_size_bytes, 8) < 0 ||
+        send_all(sock, file_data, file_size) < 0) {
+        printf("[-] Failed to send file data\n");
+        goto cleanup;
+    }
+
+    printf("[+] Sent file: %s (%ld bytes)\n", filename, file_size);
+
+    // === Receive encrypted size ===
+    unsigned char enc_size_bytes[8];
+    if (recv_all(sock, enc_size_bytes, 8) < 0) {
+        printf("[-] Failed to receive encrypted size\n");
+        goto cleanup;
+    }
+    long long enc_size = ((long long)enc_size_bytes[0] << 56) |
+                         ((long long)enc_size_bytes[1] << 48) |
+                         ((long long)enc_size_bytes[2] << 40) |
+                         ((long long)enc_size_bytes[3] << 32) |
+                         ((long long)enc_size_bytes[4] << 24) |
+                         ((long long)enc_size_bytes[5] << 16) |
+                         ((long long)enc_size_bytes[6] << 8) |
+                         ((long long)enc_size_bytes[7]);
+
+    if (enc_size < 12 + 16) {
+        printf("[-] Invalid encrypted size\n");
+        goto cleanup;
+    }
+
+    // === Receive encrypted data ===
+    unsigned char* encrypted_data = malloc(enc_size);
+    if (!encrypted_data) {
+        printf("[-] Memory allocation failed\n");
+        goto cleanup;
+    }
+    if (recv_all(sock, encrypted_data, enc_size) < 0) {
+        printf("[-] Failed to receive encrypted data\n");
+        free(encrypted_data);
+        goto cleanup;
+    }
+
+    // Save encrypted file
+    char enc_filename[512];
+    snprintf(enc_filename, sizeof(enc_filename), "%s.encrypted", filename);
+    FILE* ef = fopen(enc_filename, "wb");
+    if (ef) {
+        fwrite(encrypted_data, 1, enc_size, ef);
+        fclose(ef);
+        printf("[+] Saved encrypted file: %s\n", enc_filename);
+    }
+
+    // === Decrypt ===
+    unsigned char* nonce = encrypted_data;
+    unsigned char* ciphertext_with_tag = encrypted_data + 12;
+    int ciphertext_len = enc_size - 12 - 16;
+    unsigned char* tag = encrypted_data + 12 + ciphertext_len;
+
+    unsigned char* plaintext = malloc(ciphertext_len + 16);
+    if (!plaintext) {
+        free(encrypted_data);
+        goto cleanup;
+    }
+
+    int plaintext_len = decrypt_aes_gcm(ciphertext_with_tag, ciphertext_len, tag, nonce, plaintext);
+    if (plaintext_len < 0) {
+        printf("[-] Decryption failed! (Wrong key, corrupted data, or tampering)\n");
+        free(encrypted_data);
+        free(plaintext);
+        goto cleanup;
+    }
+
+    // Save decrypted file
+    char dec_filename[512];
+    snprintf(dec_filename, sizeof(dec_filename), "%s.decrypted", filename);
+    FILE* df = fopen(dec_filename, "wb");
+    if (df) {
+        fwrite(plaintext, 1, plaintext_len, df);
+        fclose(df);
+        printf("[+] Decrypted file saved: %s\n", dec_filename);
+    }
+
+    free(encrypted_data);
+    free(plaintext);
+
+cleanup:
+    free(file_data);
+    closesocket(sock);
+    WSACleanup();
+    return 0;
+}
